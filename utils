@@ -1,0 +1,109 @@
+import numpy as np
+from skimage.io import imread
+
+from tensorflow.keras.layers import Conv2D
+from tensorflow.keras.layers import Activation
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import Add
+from tensorflow.keras.layers import Input
+from tensorflow.keras.models import Model
+
+
+def load_dataset(filenames, batch_size, corruption_func, crop_size):
+    """
+    create a dataset for cnn
+    :param filenames: A list of filenames of clean images.
+    :param batch_size: The size of the batch of images for each iteration of Stochastic Gradient Descent.
+    :param corruption_func: A function receiving a numpy’s array representation of an image as a single argument,
+            and returns a randomly corrupted version of the input image.
+    :param crop_size: A tuple (height, width) specifying the crop size of the patches to extract.
+    :return: a generator which output (clean_image, corrupt_image)
+    """
+    images = {}
+    while True:
+        for i in range(batch_size):
+            shape = (batch_size, crop_size[0], crop_size[1])
+            return_im = np.zeros(shape)
+            return_corrupt_im = np.zeros((batch_size, crop_size[0], crop_size[1]))
+            im_num = np.random.randint(0, len(filenames))
+            if filenames[im_num] not in images:
+                cur_image = imread(filenames[im_num], as_gray=True)
+                images[filenames[im_num]] = cur_image
+            else:
+                cur_image = images[filenames[im_num]]
+            patch_start_x = np.random.randint(0, cur_image.shape[0] - 3*crop_size[0])
+            patch_start_y = np.random.randint(0, cur_image.shape[1] - 3*crop_size[1])
+            patch_cur_im = cur_image[patch_start_x: patch_start_x + 3*crop_size[0], patch_start_y: patch_start_y + 3*crop_size[1]]
+            corrupt_im = corruption_func(patch_cur_im)
+            patch_start_x = np.random.randint(0, 3*crop_size[0] - crop_size[0])
+            patch_start_y = np.random.randint(0, 3*crop_size[1] - crop_size[1])
+            return_im[i] = patch_cur_im[patch_start_x: patch_start_x + crop_size[0], patch_start_y: patch_start_y + crop_size[1]] - 0.5
+            return_corrupt_im[i] = corrupt_im[patch_start_x: patch_start_x + crop_size[0], patch_start_y: patch_start_y + crop_size[1]] - 0.5
+        yield (return_corrupt_im[:, :, :,np.newaxis], return_im[:, :, :, np.newaxis])
+
+
+def resblock(input_tensor, num_channels):
+    """
+    :param input_tensor: the input of the network
+    :param num_channels: for each layer
+    :return: residual block for network
+    """
+    conv1 = Conv2D(num_channels, (3,3), padding='same', activation='relu')(input_tensor)
+    conv2 = Conv2D(num_channels, (3,3), padding='same')(conv1)
+    conv2 = Add()([input_tensor, conv2])
+    return Activation('relu')(conv2)
+
+
+def build_nn_model(height, width, num_channels, num_res_blocks):
+    """
+    :param height: input image height
+    :param width: input image width
+    :param num_channels: num of channels for each layer
+    :param num_res_blocks: number of residual blocks in network
+    :return: an untrained nn
+    """
+    input_tensor = Input(shape=(height, width,1))
+    input = input_tensor
+    for i in range(num_res_blocks):
+        input = resblock(input, num_channels)
+    output = resblock(input_tensor, 1)
+    return Model(inputs=[input_tensor], outputs=[output])
+
+
+def train_model(model, images, corruption_func, batch_size, steps_per_epoch, num_epochs, num_valid_samples):
+    """
+    trains given model on given images
+    :param model: a general neural network model for image restoration.
+    :param images: a list of file paths pointing to image files. You should assume these paths are complete, and
+            should append anything to them.
+    :param corruption_func: A function receiving a numpy’s array representation of an image as a single argument,
+            and returns a randomly corrupted version of the input image.
+    :param batch_size: the size of the batch of examples for each iteration of SGD.
+    :param steps_per_epoch: The number of update steps in each epoch.
+    :param num_epochs: The number of epochs for which the optimization will run.
+    :param num_valid_samples: The number of samples in the validation set to test on after every epoch.
+    """
+    shape = (model.input_shape[1], model.input_shape[2])
+    split = int(len(images) * 0.8)
+    train_set = load_dataset(images[:split], batch_size, corruption_func, shape)
+    validation_set = load_dataset(images[split:], batch_size, corruption_func, shape)
+    model.compile(optimizer=Adam(beta_2=0.9), loss='mean_squared_error')
+    model.fit_generator(train_set, steps_per_epoch=steps_per_epoch, epochs=num_epochs,
+                        validation_data=validation_set, validation_steps=(num_valid_samples/batch_size))
+
+
+def restore_image(corrupted_image, base_model):
+    """
+    builds a new cnn that takes in acount the image shape and cleans the image using the cnn
+    :param corrupted_image: a corrupt image
+    :param base_model: base cnn for cleaning image
+    :return: cleaned image
+    """
+    c = corrupted_image[..., np.newaxis]
+    a = Input(c.shape)
+    b = base_model(a)
+    new_model = Model(inputs=[a], outputs=[b])
+    new_im = new_model.predict(corrupted_image[np.newaxis,...,np.newaxis])[0]
+    new_im = new_im[:,:,0]
+    new_im += 0.5
+    return new_im.astype(np.float64)
